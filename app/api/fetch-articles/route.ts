@@ -1,99 +1,92 @@
 import { NextResponse } from 'next/server';
-import { supabaseAdmin } from '@/lib/supabase';
 import { rssParser } from '@/lib/rss';
-import type { Article } from '@/types';
+import {
+  getActiveSubscriptions,
+  addArticle,
+  getArticleByLink,
+  getDatabaseInfo,
+} from '@/lib/sqlite';
 
 export async function POST() {
   try {
-    const { data: subscriptions, error: subError } = await supabaseAdmin
-      .from('subscriptions')
-      .select('*')
-      .eq('is_active', true);
+    const subscriptions = getActiveSubscriptions();
 
-    if (subError) {
-      return NextResponse.json(
-        { error: 'Failed to fetch subscriptions', details: subError.message },
-        { status: 500 }
-      );
+    if (subscriptions.length === 0) {
+      return NextResponse.json({
+        success: true,
+        message: 'No active subscriptions found',
+        statistics: {
+          subscriptions: 0,
+          totalArticles: 0,
+          newArticles: 0,
+        },
+        hint: '请先添加订阅源，使用 POST /api/subscriptions',
+      });
     }
 
-    if (!subscriptions || subscriptions.length === 0) {
-      return NextResponse.json(
-        { message: 'No active subscriptions found' },
-        { status: 200 }
-      );
-    }
+    console.log(`开始从 ${subscriptions.length} 个订阅源抓取文章...`);
 
     let totalArticles = 0;
     let newArticles = 0;
 
     for (const sub of subscriptions) {
       try {
+        console.log(`\n📰 抓取: ${sub.name}`);
         const items = await rssParser.parseFeed(sub.rss_url);
         totalArticles += items.length;
+        console.log(`  获取到 ${items.length} 篇文章`);
 
         for (const item of items) {
-          console.log('处理文章:', item.title);
-          console.log('内容长度:', item.content?.length || 0);
-          console.log('内容前100字符:', item.content?.substring(0, 100));
-
-          const { data: existing, error: checkError } = await supabaseAdmin
-            .from('articles')
-            .select('id')
-            .eq('link', item.link)
-            .single();
-
-          if (checkError && checkError.code !== 'PGRST116') {
-            console.error('检查文章失败:', checkError);
-          }
+          // 检查文章是否已存在
+          const existing = getArticleByLink(item.link);
 
           if (!existing) {
-            const articleData = {
+            // 添加新文章
+            addArticle({
               title: item.title,
               link: item.link,
               content: item.content || null,
               source: sub.name,
               pub_date: item.pubDate ? new Date(item.pubDate).toISOString() : null,
-            };
-
-            console.log('准备插入文章:', {
-              title: articleData.title,
-              contentLength: articleData.content?.length || 0,
-              hasContent: !!articleData.content,
+              analysis: null,
+              feishu_pushed: false,
+              feishu_record_id: null,
+              feishu_pushed_at: null,
             });
-
-            const { error: insertError } = await supabaseAdmin
-              .from('articles')
-              .insert(articleData);
-
-            if (insertError) {
-              console.error('插入文章失败:', insertError);
-            } else {
-              newArticles++;
-              console.log('✅ 已插入:', item.title);
-            }
+            newArticles++;
+            console.log(`  ✅ 新文章: ${item.title.substring(0, 40)}...`);
           } else {
-            console.log('⏭️ 文章已存在，跳过');
+            console.log(`  ⏭️  已存在: ${item.title.substring(0, 40)}...`);
           }
         }
       } catch (error) {
-        console.error(`Failed to fetch from ${sub.name}:`, error);
+        console.error(`❌ 从 ${sub.name} 抓取失败:`, error);
       }
     }
 
+    const dbInfo = getDatabaseInfo();
+
     return NextResponse.json({
       success: true,
-      message: `Fetched ${totalArticles} articles from ${subscriptions.length} subscriptions`,
+      message: `抓取完成，新增 ${newArticles} 篇文章`,
       statistics: {
         subscriptions: subscriptions.length,
         totalArticles,
         newArticles,
+        database: {
+          total: dbInfo.articles,
+          analyzed: dbInfo.analyzed,
+          unanalyzed: dbInfo.unanalyzed,
+        },
       },
     });
   } catch (error) {
     console.error('Error in fetch-articles API:', error);
     return NextResponse.json(
-      { error: 'Internal server error', details: String(error) },
+      {
+        error: 'Internal server error',
+        details: error instanceof Error ? error.message : String(error),
+      },
       { status: 500 }
     );
   }

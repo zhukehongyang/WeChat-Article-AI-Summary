@@ -1,0 +1,170 @@
+import { NextResponse } from 'next/server';
+import { supabaseAdmin } from '@/lib/supabase';
+import { analyzeArticle, analyzeArticlesBatch } from '@/lib/zhipu';
+import {
+  addRecordsToBitable,
+  checkRecordExists,
+  formatAnalysisForFeishu,
+} from '@/lib/feishu';
+
+export async function POST(request: Request) {
+  try {
+    const body = await request.json();
+    const { articleIds, concurrency = 3, pushToFeishu = true } = body;
+
+    // 获取未分析的文章
+    let articles;
+    if (articleIds && articleIds.length > 0) {
+      // 分析指定的文章
+      const { data, error } = await supabaseAdmin
+        .from('articles')
+        .select('*')
+        .in('id', articleIds);
+
+      if (error) throw error;
+      articles = data;
+    } else {
+      // 获取所有未分析的文章
+      const { data, error } = await supabaseAdmin
+        .from('articles')
+        .select('*')
+        .is('analysis', null)
+        .not('content', 'is', null)
+        .order('pub_date', { ascending: false })
+        .limit(20);
+
+      if (error) throw error;
+      articles = data;
+    }
+
+    if (!articles || articles.length === 0) {
+      return NextResponse.json({
+        success: true,
+        message: '没有需要分析的文章',
+        statistics: {
+          total: 0,
+          analyzed: 0,
+          pushed: 0,
+        },
+      });
+    }
+
+    console.log(`准备分析 ${articles.length} 篇文章...`);
+
+    // 批量分析文章
+    const analyses = await analyzeArticlesBatch(
+      articles.map((a) => ({ title: a.title, content: a.content || '' })),
+      concurrency
+    );
+
+    // 更新数据库中的分析结果
+    let analyzedCount = 0;
+    for (let i = 0; i < articles.length; i++) {
+      const article = articles[i];
+      const analysis = analyses[i];
+
+      const { error } = await supabaseAdmin
+        .from('articles')
+        .update({ analysis })
+        .eq('id', article.id);
+
+      if (!error) {
+        analyzedCount++;
+        console.log(`✅ 已分析并保存: ${article.title}`);
+      } else {
+        console.error(`❌ 保存分析失败: ${article.title}`, error);
+      }
+    }
+
+    // 推送到飞书多维表格
+    let pushedCount = 0;
+    let feishuErrors: string[] = [];
+
+    if (pushToFeishu) {
+      console.log('开始推送到飞书多维表格...');
+
+      // 准备推送的数据
+      const feishuRecords = articles.map((article, index) => {
+        const analysis = analyses[index];
+        const formatted = formatAnalysisForFeishu(analysis);
+
+        return {
+          title: article.title,
+          link: article.link,
+          source: article.source || '',
+          pub_date: article.pub_date,
+          ...formatted,
+        };
+      });
+
+      // 批量添加到飞书
+      const result = await addRecordsToBitable(feishuRecords);
+
+      pushedCount = result.success;
+      feishuErrors = result.errors;
+
+      console.log(
+        `✅ 飞书推送完成: 成功 ${pushedCount} 条, 失败 ${result.failed} 条`
+      );
+    }
+
+    return NextResponse.json({
+      success: true,
+      message: `分析完成 ${analyzedCount} 篇文章` +
+        (pushToFeishu ? `,推送 ${pushedCount} 条到飞书` : ''),
+      statistics: {
+        total: articles.length,
+        analyzed: analyzedCount,
+        pushed: pushedCount,
+        errors: feishuErrors,
+      },
+    });
+  } catch (error) {
+    console.error('Error in analyze-and-push API:', error);
+    return NextResponse.json(
+      {
+        error: 'Internal server error',
+        details: error instanceof Error ? error.message : String(error),
+      },
+      { status: 500 }
+    );
+  }
+}
+
+// GET 请求返回统计信息
+export async function GET() {
+  try {
+    // 获取文章统计
+    const { count: totalArticles } = await supabaseAdmin
+      .from('articles')
+      .select('*', { count: 'exact', head: true });
+
+    const { count: analyzedArticles } = await supabaseAdmin
+      .from('articles')
+      .select('*', { count: 'exact, head: true })
+      .not('analysis', 'is', null);
+
+    const { count: unanalyzedArticles } = await supabaseAdmin
+      .from('articles')
+      .select('*', { count: 'exact', head: true })
+      .is('analysis', null);
+
+    return NextResponse.json({
+      success: true,
+      statistics: {
+        total: totalArticles || 0,
+        analyzed: analyzedArticles || 0,
+        unanalyzed: unanalyzedArticles || 0,
+      },
+    });
+  } catch (error) {
+    console.error('Error in analyze-and-push GET:', error);
+    return NextResponse.json(
+      {
+        error: 'Internal server error',
+        details: error instanceof Error ? error.message : String(error),
+      },
+      { status: 500 }
+    );
+  }
+}

@@ -39,3 +39,20 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# 本地数据库
+data/
+*.db
+*.db-shm
+*.db-wal
+
+# 分析结果文件
+analysis-result.json
+
+# 临时测试脚本
+scripts/test-*.sh
+scripts/test-*.ts
+scripts/check-*.ts
+scripts/clean-*.ts
+scripts/add-test-*.ts
+scripts/init-db.ts
